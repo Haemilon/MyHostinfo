@@ -10,6 +10,10 @@
 
 원본 [saintsc-ai/MyHostinfo](https://github.com/saintsc-ai/MyHostinfo)(`3cb23e1`)에서 **Proxmox 서버 하나를 SmallTV로 늘 보는 용도**에 맞춰 고쳤습니다.
 
+![이 포크의 PVE 한 화면 — 맑음·구름 조금(CT 201 꺼짐)·비(영하)](docs/images/pve-single-screen.png)
+
+*펌웨어의 그리기를 그대로 흉내 내 만든 그림입니다(값은 예시).*
+
 | 항목 | 원본 | 이 포크 |
 |---|---|---|
 | Proxmox 화면 | 서버 정보 8초 → VM 목록 6초 → 날씨 5초 번갈아 | **PVE 한 화면만 계속**(끊기면 날씨·시계 전체 화면으로 바뀌어 장애가 보임) |
