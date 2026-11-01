@@ -212,16 +212,39 @@ def ip_addr():
         s.close()
 
 
+_PVE = {"at": 0.0, "data": None}
+_PVE_LOCK = threading.Lock()
+
+
+def pve_resources():
+    """이 노드의 VM·LXC 목록(pvesh /cluster/resources). 15초 캐시 — qm list(약 0.8초 CPU)를 3초마다 띄우지 않게."""
+    if WIN or not shutil.which("pvesh"):
+        return None
+    with _PVE_LOCK:
+        if time.time() - _PVE["at"] < 15:
+            return _PVE["data"]
+        out = _run(["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"])
+        data = None
+        if out is not None:
+            import json
+            me = socket.gethostname().split(".")[0]
+            try:
+                data = [v for v in json.loads(out) if v.get("node") == me and not v.get("template")]
+            except ValueError:
+                data = None
+        _PVE["at"], _PVE["data"] = time.time(), data
+        return data
+
+
 def vms():
-    """Proxmox 면 (실행 중, 전체) VM 수. 아니면 None."""
-    if WIN or not shutil.which("qm"):
+    """Proxmox 면 (VM 실행, VM 전체, LXC 실행, LXC 전체). 아니면 None."""
+    g = pve_resources()
+    if not g:
         return None
-    try:
-        out = subprocess.run(["qm", "list"], capture_output=True, text=True, timeout=10).stdout
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    rows = [l.split() for l in out.splitlines()[1:] if l.strip()]
-    return sum(1 for r in rows if len(r) > 2 and r[2] == "running"), len(rows)
+    q = [v for v in g if v.get("type") != "lxc"]
+    l = [v for v in g if v.get("type") == "lxc"]
+    run = lambda xs: sum(1 for v in xs if v.get("status") == "running")
+    return run(q), len(q), run(l), len(l)
 
 
 def gpu():
@@ -255,14 +278,7 @@ def _run(cmd, timeout=20):
 
 def proxmox_list():
     """(제목, 오른쪽, 요약, 줄들) 또는 None. 줄 = (상태, 이름, 값, 메모리%|None)."""
-    if WIN or not shutil.which("pvesh"):
-        return None
-    out = _run(["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"])
-    if out is None:
-        return None
-    import json
-    me = socket.gethostname().split(".")[0]
-    vms = [v for v in json.loads(out) if v.get("node") == me and not v.get("template")]
+    vms = pve_resources()
     if not vms:
         return None
     rows = []
@@ -401,7 +417,7 @@ class Lists:
     def loop(self):
         while True:
             lines = []
-            for f in (docker_list, proxmox_list):
+            for f in (docker_list,):   # Proxmox 는 목록 쪽 없이 서버 정보 화면 아래에 번호로(&…)
                 try:   # 목록을 모으거나 줄로 만들다 실패해도 상태 줄은 계속
                     item = f()
                     if item:
@@ -444,7 +460,13 @@ def build(prev):
     ]
     v = vms()
     if v:
-        fields.append(f"VM {v[0]}/{v[1]} run")
+        fields.append(f"VM {v[0]}/{v[1]} CT {v[2]}/{v[3]}")
+    gs = pve_resources()
+    if gs:   # 화면 아래(시계 자리)에 번호로: q=VM l=LXC, 상태 g 실행 y 멈춤 o 꺼짐
+        fields.append("&" + ",".join(
+            ("l" if x.get("type") == "lxc" else "q") + str(x.get("vmid")) +
+            ("g" if x.get("status") == "running" else "y" if x.get("status") == "paused" else "o")
+            for x in sorted(gs, key=lambda x: x.get("vmid", 0))))
     g = gpu()
     if g:
         fields.append(g)
