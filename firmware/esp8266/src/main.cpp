@@ -53,12 +53,18 @@ static const int PIN_CS = 15, PIN_DC = 4, PIN_RST = 5, PIN_BL = 12;
 static const int LINES = 9;
 static const uint32_t STALE_MS = 20000, DARK_MS = 300000;
 
-static Adafruit_ST7789 tft(PIN_CS, PIN_DC, PIN_RST);   // 하드웨어 SPI(HSPI: D5·D7)
+struct TFT : Adafruit_ST7789 {   // 글자 크기를 읽으려고(도 기호 그리기)
+  using Adafruit_ST7789::Adafruit_ST7789;
+  uint8_t sz() const { return textsize_x; }
+};
+static TFT tft(PIN_CS, PIN_DC, PIN_RST);   // 하드웨어 SPI(HSPI: D5·D7)
 static String model;
 static bool compact = false, blActiveLow = false;
 static int textSize = 2, lineH = 26, topY = 6, padX = 4, cornerX = 4;
 static String field[LINES], shown[LINES];
 static String clockStr, clockShown;   // "2026-10-20 Tue 01:23" — 아래 빈 공간에 큰 시계
+static int btmTop = -1;   // PVE 한 화면: 아래 시계·날씨 자리(-1 = 처음부터 다시)
+static String guestStr;   // Proxmox 게스트 "q102g,l200o"(q=VM l=LXC, 상태 g 실행 y 멈춤 o 꺼짐) — 있으면 시계 대신 번호
 static int nFields = 0;
 static uint32_t lastHost = 0;
 static bool lit = false;
@@ -84,7 +90,7 @@ static String cfgSsid, cfgPass, cfgOta, cfgShow, cfgServers, cfgGeo, devId;
 // Wi-Fi 로 받은 서버들(UDP 4210). 20초 넘게 안 오면 목록에서 안 고른다.
 // 0~7 = Wi-Fi 로 받은 서버, 8 = USB. USB 값이 오는 동안은 USB 서버만 보인다.
 static const int NET_MAX = 8, USB_SLOT = NET_MAX, SLOTS = NET_MAX + 1, MAX_PAGES = 4, UDP_PORT = 4210;
-static const uint32_t HOST_MS = 8000, LIST_MS = 6000, WX_MS = 5000, LIST_TTL = 60000;
+static const uint32_t HOST_MS = 40000, LIST_MS = 18000, WX_MS = 20000, LIST_TTL = 60000;
 struct Host { String name, line, page[MAX_PAGES]; uint32_t at = 0, seq = 0, listAt = 0; uint8_t pages = 0; };
 static Host hosts[SLOTS];
 static WiFiUDP udp;
@@ -196,31 +202,81 @@ static int pctOf(const String &s) {   // "CPU 7% 42C" → 7, "DISK 23% /" → 23
   return (sp > 0 && pc > sp) ? s.substring(sp + 1, pc).toInt() : -1;
 }
 
+// opaque: 글자 칸 바탕을 검게 같이 그린다(지우고 다시 그리지 않아 깜빡이지 않게). textEnd = 그린 글자의 오른쪽 끝
+static bool opaque = false;
+static uint16_t opaqueBg = 0;   // ST77XX_BLACK
+static int textEnd = 0;
+
+// '\xF7' = 도 기호: 글꼴 글자 대신 가는 고리를 좁은 칸(3*크기+1)에 그린다(모든 °C 가 같은 모양)
 static void text(int x, int y, const String &s, uint16_t color) {
-  tft.setTextColor(color);
+  if (opaque) tft.setTextColor(color, opaqueBg);
+  else tft.setTextColor(color);
   tft.setCursor(x, y);
-  tft.print(s);
+  int at = 0;
+  while (true) {
+    int d = s.indexOf('\xF7', at);
+    tft.print(d < 0 ? s.substring(at) : s.substring(at, d));
+    if (d < 0) break;
+    int sz = tft.sz(), cx = tft.getCursorX(), adv = 3 * sz + 1;
+    if (opaque) tft.fillRect(cx, y, adv, 8 * sz, opaqueBg);
+    tft.drawCircle(cx + sz + 1, y + sz, sz, color);
+    if (sz >= 3) tft.drawCircle(cx + sz + 1, y + sz, sz - 1, color);
+    tft.setCursor(cx + adv, y);
+    at = d + 1;
+  }
+  if (tft.getCursorX() > textEnd) textEnd = tft.getCursorX();
 }
 
+// 서버 정보 한 줄을 덮어 그리는 동안 opaque 로, 끝나면 글자 뒤 남은 칸만 지운다(전에 더 길었던 글자)
+struct OpaqueLine {
+  int y, h;
+  OpaqueLine(int y_, int h_) : y(y_), h(h_) { opaque = true; textEnd = 0; }
+  ~OpaqueLine() {
+    opaque = false;
+    if (textEnd < tft.width()) tft.fillRect(textEnd, y, tft.width() - textEnd, h, ST77XX_BLACK);
+  }
+};
+
+static String titleLeft;
 static void fancy(int i, const String &s, bool stale) {
   if (shown[i] == s + (stale ? "~" : "")) return;
+  bool fresh = !shown[i].length();
   shown[i] = s + (stale ? "~" : "");
   int y = topY + i * lineH, x = padX, w = tft.width();
-  tft.fillRect(0, y - 3, w, lineH, ST77XX_BLACK);
+  if (!s.length()) tft.fillRect(0, y - 3, w, lineH, ST77XX_BLACK);   // 빈 줄만 통째로 지운다
   tft.setTextSize(textSize);
   int cw = 6 * textSize;   // 글자 폭
   if (!s.length()) return;
-  if (i == 0) {   // 제목줄('\t' 뒤는 오른쪽 요약)
-    tft.fillRoundRect(cornerX - 6, y - 3, w - 2 * (cornerX - 6), textSize * 8 + 6, 6, stale ? C_DIM : C_HEAD);
+  if (i == 0) {   // 제목줄('\t' 뒤는 오른쪽 요약·켜진 시간). 오른쪽만 바뀌면 바탕째 덮어 그린다(깜빡임 없이)
     int tab = s.indexOf('\t');
-    text(cornerX, y, tab < 0 ? s : s.substring(0, tab), stale ? C_GRAY : ST77XX_WHITE);
-    if (tab >= 0) {
-      String r = s.substring(tab + 1);
-      text(w - cornerX - cw * r.length(), y, r, stale ? C_GRAY : r.startsWith("!") ? C_RED : C_GREEN);
+    String left = tab < 0 ? s : s.substring(0, tab), r = tab < 0 ? String("") : s.substring(tab + 1);
+    while (r.length() && r.length() < 11) r = " " + r;   // 오른쪽은 11칸 고정(짧아져도 흔적 없게)
+    int room = (w - 2 * cornerX) / cw - (int)r.length() - (r.length() ? 1 : 0);
+    if ((int)left.length() > room) left = left.substring(0, room);
+    String lk = left + (stale ? "~" : "") + String(r.length());
+    if (fresh || lk != titleLeft) {
+      titleLeft = lk;
+      tft.fillRect(0, y - 3, w, lineH, ST77XX_BLACK);
+      tft.fillRoundRect(cornerX - 6, y - 3, w - 2 * (cornerX - 6), textSize * 8 + 6, 6, stale ? C_DIM : C_HEAD);
+      text(cornerX, y, left, stale ? C_GRAY : ST77XX_WHITE);
+    }
+    if (r.length()) {
+      String t = r;
+      t.trim();
+      opaque = true;
+      opaqueBg = stale ? C_DIM : C_HEAD;
+      text(w - cornerX - cw * r.length(), y, r, stale ? C_GRAY : t.startsWith("up ") ? ST77XX_WHITE : t.startsWith("!") ? C_RED : C_GREEN);
+      opaque = false;
+      opaqueBg = ST77XX_BLACK;
     }
     return;
   }
-  if (stale) { text(x, y, s, C_GRAY); return; }
+  OpaqueLine ol(y, textSize * 8);   // 여기부터 이 줄은 지우지 않고 덮어 그린다
+  if (stale) {
+    tft.fillRect(0, y + textSize * 8, w, lineH - textSize * 8 - 3, ST77XX_BLACK);   // 막대 자리 비움
+    text(x, y, s, C_GRAY);
+    return;
+  }
   bool cpu = s.startsWith("CPU ") || s.startsWith("GPU "), ram = s.startsWith("RAM "), disk = s.startsWith("DISK ");
   if (cpu || ram || disk) {
     int pct = pctOf(s);
@@ -231,7 +287,7 @@ static void fancy(int i, const String &s, bool stale) {
       int b = rest.lastIndexOf(' '), a = rest.lastIndexOf(' ', b - 1);
       if (a > 0 && rest.charAt(b - 1) == 'c') { cnt = rest.substring(a); rest = rest.substring(0, a); }
     }
-    if (cnt.length()) text(x + (label.length() + rest.length()) * cw, y, cnt, C_GRAY);
+    if (cpu) rest.replace("C", "\xF7" "C");   // 온도 "45C" → "45°C"
     if (cpu && rest.indexOf("C") > 0) {   // 온도(와 GPU 전력)는 따로 색: "CPU 7% 42C", "GPU 35% 58C 92W"
       int t = rest.indexOf(' ', rest.indexOf('%'));
       String load = rest.substring(0, t), tc = rest.substring(t);
@@ -241,18 +297,71 @@ static void fancy(int i, const String &s, bool stale) {
     } else {
       text(x + label.length() * cw, y, rest, ST77XX_WHITE);
     }
+    if (cnt.length()) text(tft.getCursorX(), y, cnt, C_GRAY);   // 코어·스레드는 온도 바로 뒤(도 기호 칸이 좁아 글자 수로 못 셈)
     if (pct >= 0) {   // 글자 아래 막대
       int by = y + textSize * 8 + 2, bh = textSize == 2 ? 5 : 3, bw = w - 2 * x;
-      tft.fillRect(x, by, bw, bh, C_DIM);
-      tft.fillRect(x, by, bw * min(pct, 100) / 100, bh, levelColor(pct));
+      int fw = bw * min(pct, 100) / 100;   // 채운 칸과 남은 칸을 따로(먼저 지우지 않음)
+      tft.fillRect(x, by, fw, bh, levelColor(pct));
+      tft.fillRect(x + fw, by, bw - fw, bh, C_DIM);
     }
     return;
   }
-  if (s.startsWith("VM ")) {
-    int sl = s.indexOf('/');
-    int run = s.substring(3, sl).toInt(), all = s.substring(sl + 1).toInt();
-    text(x, y, "VM", C_SKY);
-    text(x + 2 * cw, y, s.substring(2), run == all ? C_GREEN : run ? C_YELLOW : C_RED);
+  if (s.startsWith("VM ")) {   // "VM 1/1 CT 0/0"(또는 예전 "VM 1/2 run") — 묶음마다 색
+    int tb = s.indexOf('\t');
+    if (tb > 0) {   // 뒤에 게스트 "q102g,l200o" 가 있으면 번호로: "VM 102 CT 200 201"(안 들어가면 개수로)
+      String g = s.substring(tb + 1), parts[2];
+      for (int k = 0; k < 2; k++) {
+        int at = 0;
+        while (at < (int)g.length()) {
+          int c = g.indexOf(',', at);
+          String t = c < 0 ? g.substring(at) : g.substring(at, c);
+          at = c < 0 ? g.length() : c + 1;
+          if (t.length() >= 3 && t[0] == (k ? 'l' : 'q')) parts[k] += t.substring(1) + ",";
+        }
+      }
+      int need = 0;
+      for (int k = 0; k < 2; k++) {
+        need += 3;
+        if (!parts[k].length()) need += 2;
+        for (int a = 0; a < (int)parts[k].length();) { int c = parts[k].indexOf(',', a); need += c - a; a = c + 1; }
+      }
+      if (need * cw <= w - 2 * x) {
+        int px = x;
+        for (int j = 0; j < 2; j++) {   // CT 먼저, VM 다음
+          int k = 1 - j;
+          text(px, y, k ? "CT " : "VM ", C_SKY);
+          px += 3 * cw;
+          if (!parts[k].length()) { text(px, y, "- ", C_GRAY); px += 2 * cw; }
+          for (int a = 0; a < (int)parts[k].length();) {
+            int c = parts[k].indexOf(',', a);
+            String t = parts[k].substring(a, c);   // "102g"
+            a = c + 1;
+            char st = t[t.length() - 1];
+            String id = t.substring(0, t.length() - 1);
+            text(px, y, id + " ", st == 'g' ? C_GREEN : st == 'y' ? C_YELLOW : C_GRAY);
+            px += (id.length() + 1) * cw;
+          }
+        }
+        return;
+      }
+    }
+    String cnt = tb > 0 ? s.substring(0, tb) : s;
+    int ci = cnt.indexOf(" CT ");
+    if (ci > 0) cnt = cnt.substring(ci + 1) + " " + cnt.substring(0, ci);   // "VM 1/1 CT 2/2" → "CT 2/2 VM 1/1"
+    int at = 0, px = x;
+    while (at < (int)cnt.length()) {
+      int sp = cnt.indexOf(' ', at);
+      String t = sp < 0 ? cnt.substring(at) : cnt.substring(at, sp);
+      at = sp < 0 ? cnt.length() : sp + 1;
+      int sl = t.indexOf('/');
+      uint16_t c = C_SKY;
+      if (sl > 0) {
+        int run = t.substring(0, sl).toInt(), all = t.substring(sl + 1).toInt();
+        c = !all ? C_GRAY : run == all ? C_GREEN : run ? C_YELLOW : C_RED;
+      } else if (t == "run") c = C_GRAY;
+      text(px, y, t + " ", c);   // 뒤 칸까지 덮어 그려 자리가 바뀌어도 흔적이 남지 않게
+      px += (t.length() + 1) * cw;
+    }
     return;
   }
   if (s.startsWith("up ")) { text(x, y, s, C_GRAY); return; }
@@ -263,6 +372,14 @@ static void fancy(int i, const String &s, bool stale) {
 static bool ntpOk() { return time(nullptr) > 1700000000; }
 
 // 보일 시계: 컴퓨터가 보낸 값, 없거나 끊기면 NTP(Wi-Fi) 시각
+// 24시간 "18:52" → 12시간 "6:52"(pad 면 " 6:52"로 자리 고정), 오전·오후는 따로 "AM"/"PM"
+static String ampm(const String &hm) { return hm.substring(0, 2).toInt() < 12 ? "AM" : "PM"; }
+static String hm12(const String &hm, bool pad) {
+  int hh = hm.substring(0, 2).toInt() % 12;
+  if (!hh) hh = 12;
+  return (pad && hh < 10 ? " " : "") + String(hh) + hm.substring(2);
+}
+
 static String nowClock(bool stale) {
   if (!stale && clockStr.length()) return clockStr;
   if (!ntpOk()) return "";
@@ -297,6 +414,8 @@ static void drawClock(int top, bool stale) {
   }
   int sp = clk.lastIndexOf(' ');
   String hm = clk.substring(sp + 1), date = clk.substring(0, sp);   // "01:23", "2026-10-20 Tue"
+  date = ampm(hm) + " " + date;
+  hm = hm12(hm, false);
   int big = free >= 70 ? 5 : free >= 50 ? 4 : 3, small = free >= 50 ? 2 : 1;
   int bh = 8 * big, sh = 8 * small, gap = 6;
   int y0 = top + 4 + (free - bh - gap - sh) / 2;
@@ -459,6 +578,8 @@ static void drawWeather(bool stale) {
     if (!clk.length()) return;
     int sp = clk.lastIndexOf(' ');
     String hm = clk.substring(sp + 1), date = clk.substring(0, sp);
+    date = ampm(hm) + " " + date;
+    hm = hm12(hm, false);
     tft.setTextSize(7);
     text((w - 42 * hm.length()) / 2, oy + 72, hm, C_YELLOW);
     tft.setTextSize(2);
@@ -472,6 +593,8 @@ static void drawWeather(bool stale) {
   if (clk.length()) {
     int sp = clk.lastIndexOf(' ');
     String hm = clk.substring(sp + 1), date = clk.substring(0, sp);
+    date = ampm(hm) + " " + date;
+    hm = hm12(hm, false);
     tft.setTextSize(6);
     text((w - 36 * hm.length()) / 2, oy + 34, hm, C_YELLOW);
     tft.setTextSize(2);
@@ -488,15 +611,11 @@ static void drawWeather(bool stale) {
   uint16_t tc = wx.t < 0 ? C_SKY : wx.t < 25 ? ST77XX_WHITE : wx.t < 30 ? C_ORANGE : C_RED;
   int rx = 92;
   tft.setTextSize(4);
-  text(rx, oy + 128, t, tc);
-  int ex = rx + 24 * t.length();
-  tft.drawCircle(ex + 5, oy + 132, 4, tc);
-  tft.drawCircle(ex + 5, oy + 132, 3, tc);
-  text(ex + 12, oy + 128, "C", tc);
+  text(rx, oy + 128, t + "\xF7" "C", tc);
   tft.setTextSize(2);
   text(rx, oy + 172, "RH", C_SKY);
   text(rx + 36, oy + 172, String(wx.rh) + "%", ST77XX_WHITE);
-  text(rx, oy + 198, String(lround(wx.tmin)) + "~" + String(lround(wx.tmax)) + "C", C_GRAY);
+  text(rx, oy + 198, String(lround(wx.tmin)) + "~" + String(lround(wx.tmax)) + "\xF7" "C", C_GRAY);
 }
 
 // 목록 쪽: 제목줄 + 줄마다 상태 점 · 이름 · 값(CPU% 등) · 아래 가는 막대(메모리)
@@ -557,6 +676,102 @@ static void drawList(int slot, int pg) {
   }
 }
 
+// 32x32 날씨 아이콘(아래 자리용, wxIcon 의 절반 크기)
+static void sunS(int cx, int cy, int r) {
+  for (int a = 0; a < 8; a++) {
+    float an = a * PI / 4, c = cos(an), s = sin(an);
+    tft.drawLine(cx + c * (r + 2), cy + s * (r + 2), cx + c * (r + 5), cy + s * (r + 5), C_YELLOW);
+  }
+  tft.fillCircle(cx, cy, r, C_YELLOW);
+}
+static void cloudS(int x, int y, uint16_t c) {   // 28x16
+  tft.fillCircle(x + 8, y + 9, 6, c);
+  tft.fillCircle(x + 16, y + 6, 7, c);
+  tft.fillCircle(x + 22, y + 10, 5, c);
+  tft.fillRoundRect(x + 2, y + 9, 26, 7, 3, c);
+}
+static void wxIconS(int x, int y, int k, bool day) {
+  const uint16_t LIGHT = 0xC618;
+  switch (k) {
+    case 0: if (day) sunS(x + 16, y + 16, 7); else moon(x + 16, y + 16, 9); break;
+    case 1:
+      if (day) sunS(x + 21, y + 10, 5); else moon(x + 22, y + 9, 6);
+      cloudS(x + 1, y + 13, ST77XX_WHITE);
+      break;
+    case 2: cloudS(x + 6, y + 4, C_GRAY); cloudS(x + 1, y + 12, LIGHT); break;
+    case 3: for (int i = 0; i < 5; i++) tft.fillRoundRect(x + 2 + (i % 2) * 4, y + 5 + i * 5, 24, 3, 1, LIGHT); break;
+    case 4:
+      cloudS(x + 2, y + 3, LIGHT);
+      for (int i = 0; i < 4; i++) tft.drawLine(x + 9 + i * 5, y + 22, x + 6 + i * 5, y + 29, C_SKY);
+      break;
+    case 5:
+      cloudS(x + 2, y + 3, LIGHT);
+      for (int i = 0; i < 4; i++) tft.fillCircle(x + 8 + i * 5, y + 23 + (i % 2) * 4, 2, ST77XX_WHITE);
+      break;
+    default:
+      cloudS(x + 2, y + 3, C_GRAY);
+      tft.fillTriangle(x + 17, y + 18, x + 11, y + 26, x + 16, y + 26, C_YELLOW);
+      tft.fillTriangle(x + 15, y + 25, x + 20, y + 25, x + 13, y + 31, C_YELLOW);
+      break;
+  }
+}
+
+// PVE 한 화면의 아래 자리: 왼쪽 큰 시계·날짜, 오른쪽 날씨 아이콘·기온·습도·최저~최고. 바뀐 부분만 다시 그린다.
+static String btmClk, btmWx;
+static void drawBottom(int top) {
+  String clk = nowClock(false);
+  String wk = wxOk() ? String(wx.at) + (wxCity) : String("-");
+  int w = tft.width(), h = tft.height();
+  if (top != btmTop) {
+    btmTop = top;
+    btmClk = btmWx = "\x01";
+    tft.fillRect(0, top, w, h - top, ST77XX_BLACK);
+    tft.drawFastHLine(cornerX, top + 2, w - 2 * cornerX, C_DIM);
+  }
+  if (clk != btmClk) {   // 시계: 글자 바탕째 덮어 그림
+    btmClk = clk;
+    opaque = true;
+    if (clk.length()) {
+      int sp = clk.lastIndexOf(' ');
+      String hm = clk.substring(sp + 1), date = clk.substring(0, sp);   // "2026-10-31 Sat"
+      if (date.length() >= 10) date = date.substring(5, 10);           // "10-31"(요일은 뺀다)
+      String ap = ampm(hm);
+      tft.setTextSize(4);
+      text(padX, top + 9, hm12(hm, true), C_YELLOW);                    // " 6:52"(자리 고정)
+      // "PM 10-31" 을 시계 오른쪽 끝(글자 사이 빈 칸 제외)에 맞춘다: 시계 5칸 x 24, 날짜 8칸 x 12
+      int dx = padX + 5 * 24 - 4 - (8 * 12 - 2);
+      tft.setTextSize(2);
+      text(dx, top + 47, ap + " ", C_YELLOW);
+      text(dx + 36, top + 47, date, C_SKY);
+    }
+    opaque = false;
+  }
+  if (wk != btmWx) {   // 날씨: 10분마다 한 번, 오른쪽 자리만 지우고 다시
+    btmWx = wk;
+    int rx = 128;
+    tft.fillRect(rx, top + 4, w - rx, h - top - 4, ST77XX_BLACK);
+    if (wxOk()) {
+      wxIconS(rx, top + 8, wxKind(wx.code), wx.day);
+      String t = String(wx.t, 1);
+      if (t.length() > 4) t = String(lround(wx.t));
+      uint16_t tc = wx.t < 0 ? C_SKY : wx.t < 25 ? ST77XX_WHITE : wx.t < 30 ? C_ORANGE : C_RED;
+      int tx = rx + 36;
+      tft.setTextSize(2);
+      text(tx, top + 10, t + "\xF7" "C", tc);
+      tft.setTextSize(1);
+      text(tx, top + 30, "RH " + String(wx.rh) + "%", C_SKY);
+      tft.setTextSize(2);
+      String mm = String(lround(wx.tmin)) + "~" + String(lround(wx.tmax)) + "\xF7" "C";
+      // 기온·습도와 같은 시작 위치. 영하로 길어 넘치면 날씨 칸(x 128~)을 넘지 않게 겹치지 않을 만큼 단위를 줄이고 오른쪽 끝에 맞춘다
+      while (mm.length() > 1 && w - 2 - 12 * (int)mm.length() < 128 && !isDigit(mm[mm.length() - 1]))
+        mm.remove(mm.length() - 1);   // "°C" → "°" → 없음
+      int mx = tx;
+      if (mx + 12 * (int)mm.length() > w - 2) mx = w - 2 - 12 * mm.length();
+      text(mx, top + 47, mm, C_GRAY);
+    }
+  }
+}
+
 static void draw(bool stale) {
   uint16_t main = stale ? 0x8410 : ST77XX_WHITE;   // 끊기면 회색
   if (compact) {
@@ -574,9 +789,11 @@ static void draw(bool stale) {
     tft.fillScreen(ST77XX_BLACK);
     for (auto &x : shown) x = "";
     clockShown = "";
+    btmTop = -1;
   }
   for (int i = 0; i < rows; i++) fancy(i, field[i], stale);
-  drawClock(topY + rows * lineH, stale);
+  if (guestStr.length() && !stale) drawBottom(topY + rows * lineH - 2);
+  else drawClock(topY + rows * lineH, stale);
 }
 
 // --- 받은 값 보관 ------------------------------------------------------------------
@@ -631,13 +848,26 @@ static void parseHost(const Host &h) {
   String rest = h.line.substring(5);
   int n = 0;
   clockStr = "";
+  guestStr = "";
   while (rest.length()) {
     int bar = rest.indexOf('|');
     String f = bar < 0 ? rest : rest.substring(0, bar);
     if (f.startsWith("@")) clockStr = f.substring(1);   // 시계는 따로(아래 큰 글씨)
+    else if (f.startsWith("&")) guestStr = f.substring(1);   // Proxmox 게스트 번호(아래 빈 공간)
     else if (n < LINES) field[n++] = f;
     if (bar < 0) break;
     rest = rest.substring(bar + 1);
+  }
+  if (guestStr.length()) {   // Proxmox 한 화면: 켜진 시간은 제목줄 오른쪽, 게스트 번호는 VM 줄 뒤에
+    String up;
+    int k = 0;
+    for (int i = 0; i < n; i++) {
+      if (field[i].startsWith("up ")) { up = field[i]; continue; }
+      if (field[i].startsWith("VM ")) field[i] += "\t" + guestStr;
+      field[k++] = field[i];
+    }
+    n = k;
+    if (up.length() && n) field[0] += "\t" + up;
   }
   nFields = n;
   for (int i = n; i < LINES; i++) field[i] = "";
@@ -844,6 +1074,7 @@ static bool candidate(int i) {
 }
 
 static int listPages(int i) {
+  if (hosts[i].line.indexOf("|&") >= 0) return 0;   // Proxmox: 목록 쪽 없이 서버 정보 한 쪽만
   return (!compact && hosts[i].pages && millis() - hosts[i].listAt < LIST_TTL) ? hosts[i].pages : 0;
 }
 
@@ -855,6 +1086,7 @@ static void setView(int k, int slot, int page) {
   tft.fillScreen(ST77XX_BLACK);
   for (auto &x : shown) x = "";
   clockShown = wxShown = listShown = "";
+  btmTop = -1;
 }
 
 // Wi-Fi 에 붙으면 주소를 15초 크게 보인다(2026-10-26 — SmallTV 는 버튼·시리얼이 없어 사용자가 주소를 찾기 어렵다).
@@ -880,6 +1112,7 @@ static void endIpHold() {
   tft.fillScreen(ST77XX_BLACK);
   for (auto &x : shown) x = "";
   clockShown = wxShown = listShown = "";
+  btmTop = -1;
   vSeq = 0xFFFFFFFF;
   if (vKind == V_NONE) draw(false);
 }
@@ -896,6 +1129,11 @@ static void schedule() {
     else if (vSlot >= 0 && vKind != V_HOST) setView(V_HOST, vSlot, 0);   // 시계도 없으면 마지막 서버를 회색으로
     return;
   }
+  for (int i = 0; i < SLOTS; i++)   // Proxmox 서버(게스트 번호를 보냄)가 있으면 그 화면 하나만 계속
+    if (candidate(i) && hosts[i].line.indexOf("|&") >= 0) {
+      if (!(vKind == V_HOST && vSlot == i)) setView(V_HOST, i, 0);
+      return;
+    }
   bool valid = (vKind == V_HOST && candidate(vSlot)) || (vKind == V_LIST && candidate(vSlot) && vPage < listPages(vSlot)) ||
                (vKind == V_WX && wxOk());
   uint32_t dur = vKind == V_HOST ? HOST_MS : vKind == V_LIST ? LIST_MS : WX_MS;
