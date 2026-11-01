@@ -6,6 +6,26 @@
 
 ![SmallTV 서버 모니터 — 서버 정보, Docker 목록, 날씨 화면](docs/images/smalltv-hero.png)
 
+## 이 포크에서 바뀐 점 (Proxmox 한 대 모니터링용)
+
+원본 [saintsc-ai/MyHostinfo](https://github.com/saintsc-ai/MyHostinfo)(`3cb23e1`)에서 **Proxmox 서버 하나를 SmallTV로 늘 보는 용도**에 맞춰 고쳤습니다.
+
+| 항목 | 원본 | 이 포크 |
+|---|---|---|
+| Proxmox 화면 | 서버 정보 8초 → VM 목록 6초 → 날씨 5초 번갈아 | **PVE 한 화면만 계속**(끊기면 날씨·시계 전체 화면으로 바뀌어 장애가 보임) |
+| 제목줄 | 서버 이름 | 서버 이름 + 오른쪽 `up 2d 21h`(흰색) |
+| VM 줄 | `VM 1/2 run`(QEMU 만) | `CT 200 201 VM 102` 번호를 상태 색으로(초록 실행·노랑 멈춤·회색 꺼짐), 한 줄에 안 들어가면 `CT 2/2 VM 1/1` |
+| 아래 칸 | 큰 시계 | 12시간 시계 `6:52` + `PM 10-31`, 날씨 아이콘(32px)·기온·습도·최저~최고 |
+| 온도 표시 | `45C` | `45°C`(모든 °C 같은 가는 원 모양) |
+| 갱신 | 바뀐 줄을 지우고 다시 그려 깜빡임 | 바탕째 덮어 그려 숫자만 바뀜 |
+| 서버 부하 | `qm list`(약 0.8초 CPU)를 3초마다 | `pvesh` 결과를 15초 캐시해 함께 씀(`qm list` 없음) |
+
+- Proxmox 가 아닌 서버(Docker 등)는 원래대로 서버 정보 → 목록 → 날씨를 번갈아 보입니다. 화면 시간은 서버 정보 40초 · 목록 18초 · 날씨 20초입니다.
+- 서버 프로그램은 HOST 줄에 게스트 번호 필드 `&q102g,l200g`(q=VM, l=LXC, 상태 g·y·o)를 더 보내고, Proxmox 목록(LIST)은 보내지 않습니다. ESP32-S3 펌웨어 소스와 PC 창 앱은 이 필드를 건너뛰게 고쳤습니다.
+- **펌웨어와 서버 프로그램을 함께 바꿔야** 위 화면이 됩니다.
+- `bin/SDP-hostinfo-smalltv.bin`·`bin/nodemcu-hostinfo.bin` 은 이 포크 소스로 다시 빌드했습니다(ESP8266 Arduino 코어 3.1.2, 4M1M — PlatformIO `espressif8266@4.2.1` 과 같은 코어·플래시 배치라 설정이 그대로 남습니다). **`bin/esp32s3-*.bin` 은 다시 빌드하지 않았습니다** — 이 포크 서버와 쓰면 `&…` 줄이 화면에 그대로 보이니, ESP32-S3 는 `firmware/esp32s3` 를 PlatformIO 로 다시 빌드해 쓰세요.
+- 이미 이 펌웨어가 든 SmallTV 는 `python espota.py -i <SmallTV 주소> -p 8266 -a "<OTA 비밀번호>" -f bin/SDP-hostinfo-smalltv.bin` 으로 올립니다.
+
 ## 세 가지 화면
 
 | | GeekMagic SmallTV | ESP32-S3 + ST7789 화면 | NodeMCU + ST7789 화면 |
