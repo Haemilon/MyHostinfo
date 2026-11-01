@@ -623,7 +623,7 @@ class Window:
         fb.text((W - 6 * small * len(date)) // 2, y0 + bh + gap, date, SKY, small)
 
     def draw_host(self, h):
-        fields = [f for f in h.line[5:].split("|") if not f.startswith("@")][:9]
+        fields = [f for f in h.line[5:].split("|") if not f.startswith(("@", "&"))][:9]
         if h.pages and h.page[0] and time.time() - h.list_at < LIST_TTL and fields:
             p = h.page[0].split("|")
             if len(p) > 2 and p[2]:

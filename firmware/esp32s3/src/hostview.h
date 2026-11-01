@@ -294,6 +294,7 @@ static void parseHost(const Host &h) {
     int bar = rest.indexOf('|');
     String f = bar < 0 ? rest : rest.substring(0, bar);
     if (f.startsWith("@")) clockStr = f.substring(1);
+    else if (f.startsWith("&")) {}   // Proxmox 게스트 번호(ESP8266 PVE 한 화면용) — 여기서는 안 씀
     else if (n < disp::LINES) field[n++] = f;
     if (bar < 0) break;
     rest = rest.substring(bar + 1);
